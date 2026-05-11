@@ -1,0 +1,603 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <Preferences.h>
+
+
+
+// =========================
+// UART DEBUG
+// =========================
+HardwareSerial SerialUart(1);
+Preferences prefs;
+
+// =========================
+// TFT / TOUCH
+// =========================
+#define TFT_CS_PIN 3
+#define TOUCH_CS 9
+#define TOUCH_IRQ 15
+#define TOUCH_SCK 38
+#define TOUCH_MISO 8
+#define TOUCH_MOSI 21
+
+// =========================
+// SPRAYS
+// =========================
+#define SPRAY1_PIN 11
+#define SPRAY2_PIN 12
+#define SPRAY3_PIN 13
+#define SPRAY4_PIN 14
+#define SPRAY_DURATION_MS 1000
+
+// =========================
+// HX711
+// =========================
+#define HX1_DOUT 1
+#define HX2_DOUT 2
+#define HX3_DOUT 18
+#define HX4_DOUT 17
+#define HX_PD_SCK 16
+
+const int HX_DOUT_PINS[4] = { HX1_DOUT, HX2_DOUT, HX3_DOUT, HX4_DOUT };
+const int SPRAY_PINS[4] = { SPRAY1_PIN, SPRAY2_PIN, SPRAY3_PIN, SPRAY4_PIN };
+
+// =========================
+// Calibration / seuil
+// =========================
+long offsets[4] = { 0, 0, 0, 0 };
+
+// Ajuste ces valeurs selon tes tests
+float scaleFactors[4] = { 265.0, 210.0, 225.0, 510.0 };
+
+float poids[4] = { 0, 0, 0, 0 };
+float poidsFiltre[4] = { 0, 0, 0, 0 };
+
+bool bouteilleVide[4] = { false, false, false, false };
+bool firstWeightRead = true;
+
+const float EMPTY_THRESHOLD_G = 20.0;
+const float FULL_BACK_THRESHOLD_G = 21.0;
+const float FILTER_ALPHA = 0.25;
+
+unsigned long lastHXRead = 0;
+const unsigned long HX_READ_INTERVAL_MS = 600;
+
+bool sprayRunning = false;
+
+// =========================
+// Touch
+// =========================
+const int TOUCH_Z_THRESHOLD = 5;
+
+// =========================
+// UI
+// =========================
+SPIClass touchSPI(FSPI);
+XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
+TFT_eSPI tft = TFT_eSPI();
+
+struct Bouton {
+  int x, y, w, h;
+  const char* nom;
+};
+
+Bouton boutonsParfum[4] = {
+  { 20, 60, 200, 100, "Parfum 1" },
+  { 260, 60, 200, 100, "Parfum 2" },
+  { 20, 180, 200, 100, "Parfum 3" },
+  { 260, 180, 200, 100, "Parfum 4" }
+};
+
+Bouton btnAdmin = { 420, 8, 50, 32, "A" };
+
+int selected = -1;
+bool lastPressed = false;
+
+// =========================
+// SPI
+// =========================
+void selectTFT() {
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(TFT_CS_PIN, LOW);
+  delayMicroseconds(20);
+}
+
+void deselectTFT() {
+  digitalWrite(TFT_CS_PIN, HIGH);
+  delayMicroseconds(20);
+}
+
+void selectTouch() {
+  digitalWrite(TFT_CS_PIN, HIGH);
+  digitalWrite(TOUCH_CS, LOW);
+  delayMicroseconds(20);
+}
+
+void deselectTouch() {
+  digitalWrite(TOUCH_CS, HIGH);
+  delayMicroseconds(20);
+}
+
+// =========================
+// UI helpers
+// =========================
+bool isInsideButton(int x, int y, const Bouton& b) {
+  return (x >= b.x - 20 && x <= b.x + b.w + 20 && y >= b.y - 20 && y <= b.y + b.h + 20);
+}
+
+void drawButton(const Bouton& b, uint16_t bg, uint16_t fg, int font = 2) {
+  tft.fillRoundRect(b.x, b.y, b.w, b.h, 10, bg);
+  tft.drawRoundRect(b.x, b.y, b.w, b.h, 10, TFT_WHITE);
+  tft.setTextColor(fg, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(b.nom, b.x + b.w / 2, b.y + b.h / 2, font);
+}
+
+void drawRedXOnButton(const Bouton& b) {
+  tft.drawLine(b.x + 15, b.y + 15, b.x + b.w - 15, b.y + b.h - 15, TFT_RED);
+  tft.drawLine(b.x + b.w - 15, b.y + 15, b.x + 15, b.y + b.h - 15, TFT_RED);
+  tft.drawLine(b.x + 16, b.y + 15, b.x + b.w - 14, b.y + b.h - 15, TFT_RED);
+  tft.drawLine(b.x + b.w - 14, b.y + 15, b.x + 16, b.y + b.h - 15, TFT_RED);
+}
+
+void drawStatus(const char* txt, uint16_t color) {
+  tft.fillRect(0, 285, 480, 35, TFT_BLACK);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString(txt, 240, 295, 2);
+}
+
+void showMessageScreen(const char* line1, const char* line2, uint16_t color, int waitMs) {
+  selectTFT();
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(line1, 240, 110, 4);
+  tft.drawString(line2, 240, 170, 4);
+
+  deselectTFT();
+  delay(waitMs);
+}
+
+void showPerfumeEmptyMessage(int idx) {
+  char line1[32];
+  snprintf(line1, sizeof(line1), "Parfum %d", idx + 1);
+  showMessageScreen(line1, "est epuise", TFT_RED, 1400);
+}
+
+// =========================
+// Preferences
+// =========================
+void saveCalibrationToNVS() {
+  prefs.begin("parfums", false);
+
+  for (int i = 0; i < 4; i++) {
+    String keyOffset = "off" + String(i);
+    prefs.putLong(keyOffset.c_str(), offsets[i]);
+  }
+
+  prefs.putBool("valid", true);
+  prefs.end();
+
+  SerialUart.println("Offsets sauvegardes");
+}
+
+bool loadCalibrationFromNVS() {
+  prefs.begin("parfums", true);
+
+  bool valid = prefs.getBool("valid", false);
+  if (!valid) {
+    prefs.end();
+    return false;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    String keyOffset = "off" + String(i);
+    offsets[i] = prefs.getLong(keyOffset.c_str(), 0);
+  }
+
+  prefs.end();
+  SerialUart.println("Offsets charges depuis la memoire");
+  return true;
+}
+
+// =========================
+// HX711
+// =========================
+bool waitAllHXReady(unsigned long timeoutMs = 120) {
+  unsigned long start = millis();
+
+  while (true) {
+    bool allReady = true;
+
+    for (int i = 0; i < 4; i++) {
+      if (digitalRead(HX_DOUT_PINS[i]) == HIGH) {
+        allReady = false;
+        break;
+      }
+    }
+
+    if (allReady) return true;
+    if (millis() - start > timeoutMs) return false;
+  }
+}
+
+long signExtend24(long value) {
+  if (value & 0x800000) value |= 0xFF000000;
+  return value;
+}
+
+bool readAllHX711Raw(long out[4]) {
+  for (int i = 0; i < 4; i++) out[i] = 0;
+
+  if (!waitAllHXReady()) {
+    return false;
+  }
+
+  for (int bit = 0; bit < 24; bit++) {
+    digitalWrite(HX_PD_SCK, HIGH);
+    delayMicroseconds(1);
+
+    for (int i = 0; i < 4; i++) {
+      out[i] <<= 1;
+    }
+
+    digitalWrite(HX_PD_SCK, LOW);
+    delayMicroseconds(1);
+
+    for (int i = 0; i < 4; i++) {
+      if (digitalRead(HX_DOUT_PINS[i])) out[i]++;
+    }
+  }
+
+  // 25e pulse = gain 128 canal A
+  digitalWrite(HX_PD_SCK, HIGH);
+  delayMicroseconds(1);
+  digitalWrite(HX_PD_SCK, LOW);
+  delayMicroseconds(1);
+
+  for (int i = 0; i < 4; i++) {
+    out[i] = signExtend24(out[i]);
+  }
+
+  return true;
+}
+
+bool readAllHX711Average(int n, long out[4]) {
+  long sum[4] = { 0, 0, 0, 0 };
+  long temp[4];
+  int goodReads = 0;
+
+  for (int i = 0; i < n; i++) {
+    if (readAllHX711Raw(temp)) {
+      for (int j = 0; j < 4; j++) sum[j] += temp[j];
+      goodReads++;
+    }
+    delay(2);
+  }
+
+  if (goodReads == 0) return false;
+
+  for (int j = 0; j < 4; j++) out[j] = sum[j] / goodReads;
+  return true;
+}
+
+void tareAllScales() {
+  SerialUart.println("TARE DES 4 CAPTEURS...");
+  showMessageScreen("RESET EN COURS...", "Retire les bouteilles", TFT_ORANGE, 1000);
+
+  long avg[4];
+  if (readAllHX711Average(10, avg)) {
+    for (int i = 0; i < 4; i++) {
+      offsets[i] = avg[i];
+      poidsFiltre[i] = 0;
+      poids[i] = 0;
+      bouteilleVide[i] = true;
+
+      SerialUart.print("Offset ");
+      SerialUart.print(i + 1);
+      SerialUart.print(" = ");
+      SerialUart.println(offsets[i]);
+    }
+
+    firstWeightRead = true;
+    saveCalibrationToNVS();
+  }
+
+  lastHXRead = 0;
+}
+
+void updateAllBottleStates() {
+  if (millis() - lastHXRead < HX_READ_INTERVAL_MS) return;
+  lastHXRead = millis();
+
+  long raw[4];
+
+  // moyenne légère pour ne pas bloquer le touch
+  if (!readAllHX711Average(3, raw)) return;
+
+  for (int i = 0; i < 4; i++) {
+    long relative = raw[i] - offsets[i];
+    float poidsInstant = (float)relative / scaleFactors[i];
+
+    if (poidsInstant < 0) poidsInstant = 0;
+
+    if (firstWeightRead) {
+      poidsFiltre[i] = poidsInstant;
+    } else {
+      poidsFiltre[i] = (FILTER_ALPHA * poidsInstant) + ((1.0 - FILTER_ALPHA) * poidsFiltre[i]);
+    }
+
+    poids[i] = poidsFiltre[i];
+
+    // hystérésis : vide sous 50g, redevient OK seulement au-dessus de 55g
+    if (!bouteilleVide[i] && poids[i] < EMPTY_THRESHOLD_G) {
+      bouteilleVide[i] = true;
+    } else if (bouteilleVide[i] && poids[i] > FULL_BACK_THRESHOLD_G) {
+      bouteilleVide[i] = false;
+    }
+
+    SerialUart.print("B");
+    SerialUart.print(i + 1);
+    SerialUart.print(" RAW=");
+    SerialUart.print(raw[i]);
+    SerialUart.print(" REL=");
+    SerialUart.print(relative);
+    SerialUart.print(" SCALE=");
+    SerialUart.print(scaleFactors[i]);
+    SerialUart.print(" POIDS=");
+    SerialUart.print(poids[i]);
+    SerialUart.print(" g | ");
+    SerialUart.println(bouteilleVide[i] ? "VIDE" : "OK");
+  }
+
+  firstWeightRead = false;
+}
+
+// =========================
+// Draw menu
+// =========================
+void drawMenuScreen() {
+  selectTFT();
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Choisis ton parfum", 240, 20, 4);
+
+  drawButton(btnAdmin, TFT_DARKGREY, TFT_WHITE, 2);
+
+  for (int i = 0; i < 4; i++) {
+    uint16_t bg = (i == selected) ? TFT_GREEN : TFT_DARKGREY;
+    uint16_t fg = (i == selected) ? TFT_BLACK : TFT_WHITE;
+    drawButton(boutonsParfum[i], bg, fg, 4);
+
+    if (bouteilleVide[i]) {
+      drawRedXOnButton(boutonsParfum[i]);
+    }
+  }
+
+  if (selected == -1) {
+    drawStatus("Choisis ton parfum", TFT_YELLOW);
+  } else if (bouteilleVide[selected]) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Parfum %d fini", selected + 1);
+    drawStatus(msg, TFT_RED);
+  } else {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Choix : Parfum %d", selected + 1);
+    drawStatus(msg, TFT_GREEN);
+  }
+
+  deselectTFT();
+}
+
+void updatePerfumeButton(int i) {
+  uint16_t bg = (i == selected) ? TFT_GREEN : TFT_DARKGREY;
+  uint16_t fg = (i == selected) ? TFT_BLACK : TFT_WHITE;
+
+  selectTFT();
+  drawButton(boutonsParfum[i], bg, fg, 4);
+
+  if (bouteilleVide[i]) {
+    drawRedXOnButton(boutonsParfum[i]);
+  }
+
+  deselectTFT();
+}
+
+void updateStatusOnly() {
+  selectTFT();
+
+  if (selected == -1) {
+    drawStatus("Choisis ton parfum", TFT_YELLOW);
+  } else if (bouteilleVide[selected]) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Parfum %d fini", selected + 1);
+    drawStatus(msg, TFT_RED);
+  } else {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Choix : Parfum %d", selected + 1);
+    drawStatus(msg, TFT_GREEN);
+  }
+
+  deselectTFT();
+}
+
+void updateSelectedPerfume(int newIndex) {
+  int oldSelected = selected;
+  selected = newIndex;
+
+  if (oldSelected >= 0 && oldSelected < 4 && oldSelected != selected) {
+    updatePerfumeButton(oldSelected);
+  }
+
+  updatePerfumeButton(selected);
+  updateStatusOnly();
+}
+
+// =========================
+// Touch
+// =========================
+bool readTouchMapped(int& x, int& y) {
+  selectTouch();
+
+  TS_Point p = ts.getPoint();
+
+  deselectTouch();
+
+  if (p.z < TOUCH_Z_THRESHOLD) return false;
+  if (p.x < 100 || p.y < 100) return false;
+
+  x = map(p.x, 230, 3590, 480, 0);
+  y = map(p.y, 640, 3870, 320, 0);
+
+  x = constrain(x, 0, 479);
+  y = constrain(y, 0, 319);
+
+  return true;
+}
+
+int getPerfumeIndex(int x, int y) {
+  for (int i = 0; i < 4; i++) {
+    if (isInsideButton(x, y, boutonsParfum[i])) return i;
+  }
+  return -1;
+}
+
+// =========================
+// Sprays
+// =========================
+void stopAllSprays() {
+  for (int i = 0; i < 4; i++) digitalWrite(SPRAY_PINS[i], LOW);
+}
+
+void activateSpray(int idx) {
+  stopAllSprays();
+  sprayRunning = true;
+
+  SerialUart.print("SPRAY ");
+  SerialUart.print(idx + 1);
+  SerialUart.println(" ON");
+
+  selectTFT();
+  drawStatus("Spray actif", TFT_CYAN);
+  deselectTFT();
+
+  digitalWrite(SPRAY_PINS[idx], HIGH);
+  delay(SPRAY_DURATION_MS);
+  digitalWrite(SPRAY_PINS[idx], LOW);
+
+  sprayRunning = false;
+
+  SerialUart.print("SPRAY ");
+  SerialUart.print(idx + 1);
+  SerialUart.println(" OFF");
+
+  updateStatusOnly();
+}
+
+// =========================
+// Setup
+// =========================
+void setup() {
+  SerialUart.begin(115200, SERIAL_8N1, 44, 43);
+
+  pinMode(TFT_CS_PIN, OUTPUT);
+  pinMode(TOUCH_CS, OUTPUT);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(SPRAY_PINS[i], OUTPUT);
+    pinMode(HX_DOUT_PINS[i], INPUT);
+  }
+
+  pinMode(HX_PD_SCK, OUTPUT);
+  digitalWrite(HX_PD_SCK, LOW);
+
+  digitalWrite(TFT_CS_PIN, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+
+  stopAllSprays();
+
+  selectTFT();
+  tft.init();
+  tft.setRotation(1);
+  deselectTFT();
+
+  touchSPI.begin(TOUCH_SCK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+
+  selectTouch();
+  ts.begin(touchSPI);
+  ts.setRotation(1);
+  deselectTouch();
+
+  if (!loadCalibrationFromNVS()) {
+    SerialUart.println("Aucune calibration sauvegardee");
+    showMessageScreen("AUCUNE CALIBRATION", "Appuie sur A pour RESET", TFT_RED, 1200);
+  }
+
+  updateAllBottleStates();
+  drawMenuScreen();
+
+  SerialUart.println("SYSTEME PRET");
+}
+
+// =========================
+// Loop
+// =========================
+void loop() {
+  static bool oldVide[4] = { false, false, false, false };
+
+  if (!sprayRunning) {
+    updateAllBottleStates();
+  }
+
+  bool changed = false;
+  for (int i = 0; i < 4; i++) {
+    if (oldVide[i] != bouteilleVide[i]) {
+      oldVide[i] = bouteilleVide[i];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    drawMenuScreen();
+  }
+
+  int x, y;
+  bool pressed = readTouchMapped(x, y);
+
+  if (pressed && !lastPressed) {
+    if (isInsideButton(x, y, btnAdmin)) {
+      tareAllScales();
+      updateAllBottleStates();
+      showMessageScreen("RESET TERMINE", "Les 4 capteurs = 0", TFT_GREEN, 800);
+      selected = -1;
+      drawMenuScreen();
+    } else {
+      int idx = getPerfumeIndex(x, y);
+
+      if (idx != -1) {
+        SerialUart.print("PARFUM ");
+        SerialUart.print(idx + 1);
+        SerialUart.println(" DETECTE");
+
+        updateSelectedPerfume(idx);
+
+        if (bouteilleVide[idx]) {
+          showPerfumeEmptyMessage(idx);
+          selected = -1;
+          drawMenuScreen();
+        } else {
+          activateSpray(idx);
+        }
+      }
+    }
+  }
+
+  lastPressed = pressed;
+  delay(8);
+}
