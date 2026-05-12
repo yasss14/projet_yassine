@@ -45,17 +45,24 @@ const int SPRAY_PINS[4] = { SPRAY1_PIN, SPRAY2_PIN, SPRAY3_PIN, SPRAY4_PIN };
 long offsets[4] = { 0, 0, 0, 0 };
 
 // Ajuste ces valeurs selon tes tests
-float scaleFactors[4] = { 265.0, 210.0, 225.0, 510.0 };
+float scaleFactors[4] = {240.05, 249.52, 193.0, 490.00};
 
 float poids[4] = { 0, 0, 0, 0 };
 float poidsFiltre[4] = { 0, 0, 0, 0 };
+
+float poidsBouteilleVide[4] = {35.0, 30.0, 30.0, 42.0};
+float poidsLiquide[4] = {0, 0, 0, 0};
+
+float capaciteLiquideMax[4] = {480.0, 350.0, 445.0, 437.0}; // poids liquide quand bouteille pleine
+int pourcentageLiquide[4] = {0, 0, 0, 0};
 
 bool bouteilleVide[4] = { false, false, false, false };
 bool firstWeightRead = true;
 
 const float EMPTY_THRESHOLD_G = 20.0;
 const float FULL_BACK_THRESHOLD_G = 21.0;
-const float FILTER_ALPHA = 0.25;
+const float FILTER_ALPHA = 0.60;
+const float BIG_WEIGHT_CHANGE_G = 40.0;
 
 unsigned long lastHXRead = 0;
 const unsigned long HX_READ_INTERVAL_MS = 600;
@@ -129,6 +136,7 @@ void drawButton(const Bouton& b, uint16_t bg, uint16_t fg, int font = 2) {
   tft.setTextColor(fg, bg);
   tft.setTextDatum(MC_DATUM);
   tft.drawString(b.nom, b.x + b.w / 2, b.y + b.h / 2, font);
+  
 }
 
 void drawRedXOnButton(const Bouton& b) {
@@ -321,31 +329,45 @@ void updateAllBottleStates() {
 
     if (poidsInstant < 0) poidsInstant = 0;
 
-    if (firstWeightRead) {
+  if (firstWeightRead) {
+    poidsFiltre[i] = poidsInstant;
+  } 
+  else {
+    // Si gros changement, exemple tu viens de déposer une bouteille,
+    // on met direct la vraie valeur au lieu de monter lentement.
+    if (abs(poidsInstant - poidsFiltre[i]) > BIG_WEIGHT_CHANGE_G) {
       poidsFiltre[i] = poidsInstant;
     } else {
       poidsFiltre[i] = (FILTER_ALPHA * poidsInstant) + ((1.0 - FILTER_ALPHA) * poidsFiltre[i]);
     }
+  }
 
-    poids[i] = poidsFiltre[i];
+  poids[i] = poidsFiltre[i];
+  
+    poidsLiquide[i] = poids[i] - poidsBouteilleVide[i];
+    if (poidsLiquide[i] < 0) poidsLiquide[i] = 0;
+    pourcentageLiquide[i] = (poidsLiquide[i] / capaciteLiquideMax[i]) * 100.0;
+    pourcentageLiquide[i] = constrain(pourcentageLiquide[i], 0, 100);
+
+    if (poidsLiquide[i] < 0) poidsLiquide[i] = 0;
 
     // hystérésis : vide sous 50g, redevient OK seulement au-dessus de 55g
-    if (!bouteilleVide[i] && poids[i] < EMPTY_THRESHOLD_G) {
+    if (!bouteilleVide[i] && poidsLiquide[i] < EMPTY_THRESHOLD_G) {
       bouteilleVide[i] = true;
-    } else if (bouteilleVide[i] && poids[i] > FULL_BACK_THRESHOLD_G) {
+    } else if (bouteilleVide[i] && poidsLiquide[i] > FULL_BACK_THRESHOLD_G) {
       bouteilleVide[i] = false;
     }
 
     SerialUart.print("B");
     SerialUart.print(i + 1);
-    SerialUart.print(" RAW=");
-    SerialUart.print(raw[i]);
     SerialUart.print(" REL=");
     SerialUart.print(relative);
     SerialUart.print(" SCALE=");
     SerialUart.print(scaleFactors[i]);
-    SerialUart.print(" POIDS=");
+    SerialUart.print(" TOTAL=");
     SerialUart.print(poids[i]);
+    SerialUart.print(" g | LIQUIDE=");
+    SerialUart.print(poidsLiquide[i]);
     SerialUart.print(" g | ");
     SerialUart.println(bouteilleVide[i] ? "VIDE" : "OK");
   }
@@ -370,6 +392,15 @@ void drawMenuScreen() {
     uint16_t bg = (i == selected) ? TFT_GREEN : TFT_DARKGREY;
     uint16_t fg = (i == selected) ? TFT_BLACK : TFT_WHITE;
     drawButton(boutonsParfum[i], bg, fg, 4);
+    char percentTxt[16];
+    snprintf(percentTxt, sizeof(percentTxt), "%d%%", pourcentageLiquide[i]);
+
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(percentTxt,
+                  boutonsParfum[i].x + boutonsParfum[i].w / 2,
+                  boutonsParfum[i].y + boutonsParfum[i].h - 22,
+                  2);
 
     if (bouteilleVide[i]) {
       drawRedXOnButton(boutonsParfum[i]);
@@ -397,7 +428,15 @@ void updatePerfumeButton(int i) {
 
   selectTFT();
   drawButton(boutonsParfum[i], bg, fg, 4);
+  char percentTxt[16];
+  snprintf(percentTxt, sizeof(percentTxt), "%d%%", pourcentageLiquide[i]);
 
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(percentTxt,
+                boutonsParfum[i].x + boutonsParfum[i].w / 2,
+                boutonsParfum[i].y + boutonsParfum[i].h - 22,
+                2);
   if (bouteilleVide[i]) {
     drawRedXOnButton(boutonsParfum[i]);
   }
@@ -546,16 +585,23 @@ void setup() {
 // =========================
 void loop() {
   static bool oldVide[4] = { false, false, false, false };
+  static int oldPourcentage[4] = {-1, -1, -1, -1};
 
   if (!sprayRunning) {
     updateAllBottleStates();
   }
 
   bool changed = false;
+
   for (int i = 0; i < 4; i++) {
     if (oldVide[i] != bouteilleVide[i]) {
       oldVide[i] = bouteilleVide[i];
       changed = true;
+    }
+
+    if (oldPourcentage[i] != pourcentageLiquide[i]) {
+      oldPourcentage[i] = pourcentageLiquide[i];
+      updatePerfumeButton(i);
     }
   }
 
