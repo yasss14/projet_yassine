@@ -45,15 +45,15 @@ const int SPRAY_PINS[4] = { SPRAY1_PIN, SPRAY2_PIN, SPRAY3_PIN, SPRAY4_PIN };
 long offsets[4] = { 0, 0, 0, 0 };
 
 // Ajuste ces valeurs selon tes tests
-float scaleFactors[4] = {240.05, 249.52, 193.0, 490.00};
+float scaleFactors[4] = {240.0, 200.0, 190.0, 490.00};
 
 float poids[4] = { 0, 0, 0, 0 };
 float poidsFiltre[4] = { 0, 0, 0, 0 };
 
-float poidsBouteilleVide[4] = {35.0, 30.0, 30.0, 42.0};
+float poidsBouteilleVide[4] = {44.0, 45.0, 45.0, 44.0};
 float poidsLiquide[4] = {0, 0, 0, 0};
 
-float capaciteLiquideMax[4] = {480.0, 350.0, 445.0, 437.0}; // poids liquide quand bouteille pleine
+float capaciteLiquideMax[4] = {468.0, 490.0, 488.0, 470.0}; // poids liquide quand bouteille pleine
 int pourcentageLiquide[4] = {0, 0, 0, 0};
 
 bool bouteilleVide[4] = { false, false, false, false };
