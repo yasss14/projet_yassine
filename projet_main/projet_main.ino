@@ -53,7 +53,7 @@ float poidsFiltre[4] = { 0, 0, 0, 0 };
 float poidsBouteilleVide[4] = {44.0, 45.0, 45.0, 44.0};
 float poidsLiquide[4] = {0, 0, 0, 0};
 
-float capaciteLiquideMax[4] = {468.0, 490.0, 488.0, 470.0}; // poids liquide quand bouteille pleine
+float capaciteLiquideMax[4] = {437.0, 457.0, 455.0, 436.0}; // poids liquide quand bouteille pleine
 int pourcentageLiquide[4] = {0, 0, 0, 0};
 
 bool bouteilleVide[4] = { false, false, false, false };
